@@ -4,6 +4,7 @@
 #include <cuda/barrier>
 #include <cuda_runtime.h>
 #include <cudaTypedefs.h>
+#include <cub/cub.cuh>
 #include <cstdio>
 #include <random>
 #include <vector>
@@ -50,7 +51,61 @@ bool verify(int* C, int* Cref, int N) {
     return true;
 }
 
+static inline __device__ uint16_t extract_bin_idx(float x) {
+    union { __half h; uint16_t u16; } tmp;
+    tmp.h = __float2half_rn(x);
+    tmp.u16 = (x < 0.f) ? (~tmp.u16 & 0xffff) : (tmp.u16 | 0x8000);
+    return (tmp.u16 >> 7); // use most significant 9 bits to bin into 512 (2^9) bins
+}
+
+template<int NUM_THREADS>
 __global__ void topk(float *logits, int *indices, int B, int V, int K) {
+    constexpr int num_bins = NUM_THREADS; // key assumption
+
+    __shared__ int smem_hist[num_bins]; // will also house the prefix sum result
+    __shared__ int smem_threshold_bin_idx;
+    __shared__ int smem_ki;
+
+    __shared__ typename cub::BlockScan<int, NUM_THREADS>::TempStorage smem_scan;
+
+    float* cur_logits = logits + blockIdx.x * V;
+    int* cur_indices = indices + blockIdx.x * K;
+
+    // 1. Create histogram of 512 bins
+    for (int i = threadIdx.x; i < V; i += blockDim.x) {
+        uint16_t bin_idx = extract_bin_idx(cur_logits[i]);
+        atomicAdd(&smem_hist[bin_idx], 1);
+    }
+    __syncthreads();
+
+    // 2. Exclusive prefix sum to get start index of each bin
+    using Scan = cub::BlockScan<int, NUM_THREADS>;
+    int bin_count = smem_hist[threadIdx.x], prefix_sum = 0, total_sum = 0;
+    __syncthreads();
+    
+    Scan(smem_scan).ExclusiveSum(bin_count, prefix_sum, total_sum); // ty cub
+
+    // 3. Find threshold bin index
+    int threshold_val_idx = total_sum - K;
+    int low = prefix_sum, high = prefix_sum + bin_count;
+    if (low <= threshold_val_idx && threshold_val_idx < high)
+        smem_threshold_bin_idx = threadIdx.x;
+
+    if (threadIdx.x == 0) smem_ki = 0; // TODO REVIEW can i get rid of this?
+    __syncthreads();
+
+    // 4. Collect top K indices of bins greater than threshold bin
+    for (int i = threadIdx.x; i < V; i += blockDim.x) {
+        uint16_t bin_idx = extract_bin_idx(cur_logits[i]);
+        if (bin_idx > smem_threshold_bin_idx) { // guaranteed that it's in top K
+            int ki = atomicAdd(&smem_ki, 1);
+            cur_indices[ki] = i;
+        }
+    }
+
+    // 5. Collect top K indices from threashold bin
+    int k_remaining = K - smem_ki;
+    if (k_remaining == 0) return; // lucky!
 }
 
 void cpu_topk(float *logits, int *indices, int B, int V, int K) {
@@ -94,8 +149,8 @@ int main() {
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
 
-    const int B = 2, V = 5;
-    constexpr int K = 2;
+    const int B = 1, V = 50000;
+    constexpr int K = 10;
     constexpr int NUM_THREADS = 512;
     constexpr int repeat_times = 50;
 
@@ -109,14 +164,16 @@ int main() {
     std::mt19937 gen(42);
     std::normal_distribution<float> distribution(0, 1);
     for (int i = 0; i < B*V; i++) hlogits[i] = distribution(gen);
-    print_matrix("logits", hlogits, B, V);
+    // print_matrix("logits", hlogits, B, V);
 
     cudaCheck(cudaMalloc((void**)&dlogits, B*V*sizeof(float)));
     cudaCheck(cudaMalloc((void**)&dindices, B*K*sizeof(int)));
 
     cudaMemcpy(dlogits, hlogits, B*V*sizeof(float), cudaMemcpyHostToDevice);
 
-    topk<<<B, NUM_THREADS>>>(dlogits, dindices, B, V, K);
+    auto kernel = topk<NUM_THREADS>;
+
+    kernel<<<B, NUM_THREADS>>>(dlogits, dindices, B, V, K);
     cudaCheck(cudaDeviceSynchronize());
     cudaCheck(cudaGetLastError());
 
@@ -124,10 +181,11 @@ int main() {
 
     cpu_topk(hlogits, hindices_ref, B, V, K);
     print_matrix("indices_ref", hindices_ref, B, K);
+    print_matrix("indices", hindices, B, K);
     if (!verify(hindices, hindices_ref, B*K)) return -1;
 
     cudaEventRecord(start);
-    for (int i = 0; i < repeat_times; i++) topk<<<B, NUM_THREADS>>>(dlogits, dindices, B, V, K);
+    for (int i = 0; i < repeat_times; i++) kernel<<<B, NUM_THREADS>>>(dlogits, dindices, B, V, K);
     cudaEventRecord(stop);
     cudaEventSynchronize(start); cudaEventSynchronize(stop); cudaEventElapsedTime(&elapsed_time, start, stop);
 
