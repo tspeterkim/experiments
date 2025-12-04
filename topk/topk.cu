@@ -69,6 +69,8 @@ static inline __device__ uint16_t extract_bin_idx(float x) {
 
 template<int NUM_THREADS>
 __global__ void topk(float *logits, int *indices, int B, int V, int K) {
+    bool cond = threadIdx.x == 0 && blockIdx.x == 0;
+    // if (cond) printf("starting topk\n");
     constexpr int num_bins = NUM_THREADS; // key assumption
     constexpr int num_final_per_thread = SAFE_UPPER_BOUND / NUM_THREADS;
 
@@ -89,7 +91,10 @@ __global__ void topk(float *logits, int *indices, int B, int V, int K) {
     int* cur_indices = indices + blockIdx.x * K;
 
     // 1. Create histogram of 512 bins
-    for (int i = threadIdx.x; i < V; i += blockDim.x) {
+    smem_hist[threadIdx.x] = 0;
+    __syncthreads();
+
+    for (int i = threadIdx.x; i < V; i += NUM_THREADS) {
         uint16_t bin_idx = extract_bin_idx(cur_logits[i]);
         atomicAdd(&smem_hist[bin_idx], 1);
     }
@@ -131,13 +136,13 @@ __global__ void topk(float *logits, int *indices, int B, int V, int K) {
     float final_logits[num_final_per_thread];
     int final_indices[num_final_per_thread];
 
-    for (int i = threadIdx.x; i < SAFE_UPPER_BOUND; i += blockDim.x) {
+    for (int i = threadIdx.x, j = 0; i < SAFE_UPPER_BOUND; i += blockDim.x, j++) {
         if (i < smem_fi) {
-            final_logits[i] = smem_final_items.logits[i];
-            final_indices[i] = smem_final_items.indices[i];
+            final_logits[j] = smem_final_items.logits[i];
+            final_indices[j] = smem_final_items.indices[i];
         } else {
-            final_logits[i] = -FLT_MAX;
-            final_indices[i] = -1; // TODO REVIEW necessary?
+            final_logits[j] = -FLT_MAX;
+            final_indices[j] = -1; // TODO REVIEW necessary?
         }
     }
 
