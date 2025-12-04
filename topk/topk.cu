@@ -94,6 +94,7 @@ __global__ void topk(float *logits, int *indices, int B, int V, int K) {
     smem_hist[threadIdx.x] = 0;
     __syncthreads();
 
+    #pragma unroll
     for (int i = threadIdx.x; i < V; i += NUM_THREADS) {
         uint16_t bin_idx = extract_bin_idx(cur_logits[i]);
         atomicAdd(&smem_hist[bin_idx], 1);
@@ -117,7 +118,8 @@ __global__ void topk(float *logits, int *indices, int B, int V, int K) {
     __syncthreads();
 
     // 4. Collect top K indices of bins greater than threshold bin
-    for (int i = threadIdx.x; i < V; i += blockDim.x) {
+    #pragma unroll
+    for (int i = threadIdx.x; i < V; i += NUM_THREADS) {
         uint16_t bin_idx = extract_bin_idx(cur_logits[i]);
         if (bin_idx > smem_threshold_bin_idx) { // guaranteed that it's in top K
             int ki = atomicAdd(&smem_ki, 1);
@@ -136,7 +138,8 @@ __global__ void topk(float *logits, int *indices, int B, int V, int K) {
     float final_logits[num_final_per_thread];
     int final_indices[num_final_per_thread];
 
-    for (int i = threadIdx.x, j = 0; i < SAFE_UPPER_BOUND; i += blockDim.x, j++) {
+    #pragma unroll
+    for (int i = threadIdx.x, j = 0; i < SAFE_UPPER_BOUND; i += NUM_THREADS, j++) {
         if (i < smem_fi) {
             final_logits[j] = smem_final_items.logits[i];
             final_indices[j] = smem_final_items.indices[i];
